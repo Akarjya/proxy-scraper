@@ -51,7 +51,8 @@
 <body onload="preFetch()">
     <h1>Welcome! Click to Proceed</h1>
     <p>By proceeding, you agree to data processing for better experience.</p>
-    <form id="proceedForm" action="/scrape?url=https%3A%2F%2Fwww.whatismyip.com" method="GET">
+    <form id="proceedForm" action="/scrape" method="POST">
+        <input type="hidden" name="url" value="https://www.whatismyip.com">
         <button type="submit" id="proceedButton">Proceed</button>
     </form>
     <div id="loading">
@@ -82,9 +83,22 @@
             document.getElementById('proceedButton').style.display = 'none';
             document.getElementById('loading').style.display = 'block';
             document.getElementById('error').style.display = 'none';
-            setTimeout(function() {
-                document.getElementById('proceedForm').submit();
-            }, 500);
+            const formData = new FormData(document.getElementById('proceedForm'));
+            fetch('/scrape', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ url: formData.get('url') })
+            }).then(response => response.text())
+              .then(data => {
+                  document.body.innerHTML = data; // Load content directly
+              })
+              .catch(error => {
+                  document.getElementById('loading').style.display = 'none';
+                  document.getElementById('error').style.display = 'block';
+                  document.getElementById('error').innerText = 'Error loading content: ' + error.message;
+              });
         });
     </script>
 </body>
