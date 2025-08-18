@@ -8,4 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN playwright install --with-deps chromium
 
+RUN playwright install --with-deps firefox  # Added for Firefox support
+
 CMD uvicorn app:app --host 0.0.0.0 --port $PORT
