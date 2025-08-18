@@ -4,9 +4,13 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies, force-reinstall playwright to ensure correct path
+RUN pip install --no-cache-dir -r requirements.txt --force-reinstall
 
 COPY app.py .
+
+# Ensure temp profile dir permissions
+RUN mkdir -p /app/temp && chmod -R 777 /app/temp
 
 EXPOSE 8000
 
