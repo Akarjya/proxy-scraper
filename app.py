@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import time
 from typing import Dict
 
-# Fallback for FINAL_URL if config.py missing
+# Fallback for FINAL_URL
 try:
     from config import FINAL_URL
 except ImportError:
@@ -44,6 +44,11 @@ USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
 ]
+
+# Generate random 10-char string for proxy username
+def generate_proxy_username():
+    random_string = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+    return f"{BASE_USERNAME}{random_string}{USERNAME_SUFFIX}"
 
 TIMEZONE_SPOOF_JS = f"""
   (function() {{
@@ -215,7 +220,6 @@ async def pre_fetch(request: Request):
     body = await request.json()
     user_agent = body.get('userAgent', random.choice(USER_AGENTS))
     
-    # Pre-fetch and cache (background)
     asyncio.create_task(_scrape_and_cache(session_id, FINAL_URL, user_agent))
     return JSONResponse({"status": "pre-fetch started"})
 
@@ -224,10 +228,11 @@ async def _scrape_and_cache(session_id: str, url: str, user_agent: str):
         if session_id not in contexts:
             user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
             os.makedirs(user_data_dir, exist_ok=True)
+            proxy_username = generate_proxy_username()
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 headless=True,
-                proxy={"server": f"socks5h://{BASE_USERNAME}{session_id}{USERNAME_SUFFIX}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
+                proxy={"server": f"socks5://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
                 user_agent=user_agent,
                 viewport={'width': 390, 'height': 844} if 'mobile' in user_agent.lower() or 'iphone' in user_agent.lower() or 'android' in user_agent.lower() else {'width': 1920, 'height': 1080},
                 locale='en-US',
@@ -298,11 +303,11 @@ async def _scrape_and_cache(session_id: str, url: str, user_agent: str):
             if session_id in cached_content:
                 del cached_content[session_id]
         except Exception as e:
-            cached_content[session_id] = f"Pre-fetch failed: {str(e)}"
+            cached_content[session_id] = f"Pre-fetch failed: {str(e)}. Please try again."
             print(f"Pre-fetch error: {str(e)}")
 
 @app.get("/scrape")
-async def scrape(request: Request, response: Response, url: str):
+async def scrape_get(request: Request, response: Response, url: str):
     session_id = request.session.get('session_id')
     if not session_id:
         return HTMLResponse("Error: No session. Please start from /middle.")
@@ -315,6 +320,29 @@ async def scrape(request: Request, response: Response, url: str):
         else:
             return content
 
+    return await scrape(request, response, url)
+
+@app.post("/scrape")
+async def scrape_post(request: Request, response: Response):
+    session_id = request.session.get('session_id')
+    if not session_id:
+        return HTMLResponse("Error: No session. Please start from /middle.")
+
+    body = await request.json()
+    url = body.get('url', FINAL_URL)
+
+    if session_id in cached_content:
+        content = cached_content[session_id]
+        del cached_content[session_id]
+        if content.startswith("Pre-fetch failed"):
+            pass
+        else:
+            return content
+
+    return await scrape(request, response, url)
+
+async def scrape(request: Request, response: Response, url: str):
+    session_id = request.session.get('session_id')
     user_agent = request.headers.get('User-Agent', random.choice(USER_AGENTS))
     cookies = request.cookies
     is_mobile = 'mobile' in user_agent.lower() or 'iphone' in user_agent.lower() or 'android' in user_agent.lower()
@@ -324,10 +352,11 @@ async def scrape(request: Request, response: Response, url: str):
         if session_id not in contexts:
             user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
             os.makedirs(user_data_dir, exist_ok=True)
+            proxy_username = generate_proxy_username()
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 headless=True,
-                proxy={"server": f"socks5h://{BASE_USERNAME}{session_id}{USERNAME_SUFFIX}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
+                proxy={"server": f"socks5://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
                 user_agent=user_agent,
                 viewport=viewport,
                 locale='en-US',
