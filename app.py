@@ -12,7 +12,12 @@ from urllib.parse import urljoin, quote_plus
 from urllib.parse import urlparse
 import time
 from typing import Dict
-from config import FINAL_URL
+
+# Fallback for FINAL_URL if config.py missing
+try:
+    from config import FINAL_URL
+except ImportError:
+    FINAL_URL = "https://www.whatismyip.com/"
 
 app = FastAPI()
 
@@ -289,7 +294,6 @@ async def _scrape_and_cache(session_id: str, url: str, user_agent: str):
 
             rewritten_content = str(soup)
             cached_content[session_id] = rewritten_content
-            # Cache timeout (30s)
             await asyncio.sleep(30)
             if session_id in cached_content:
                 del cached_content[session_id]
@@ -307,7 +311,6 @@ async def scrape(request: Request, response: Response, url: str):
         content = cached_content[session_id]
         del cached_content[session_id]
         if content.startswith("Pre-fetch failed"):
-            # Fallback scrape on error
             pass
         else:
             return content
