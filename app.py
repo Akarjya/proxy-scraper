@@ -5,6 +5,7 @@ import time
 import asyncio
 import os
 import hashlib  # For deterministic random based on session_id
+import requests  # Added for proxy test
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -18,8 +19,15 @@ app = FastAPI()
 contexts = {}
 cached_content = {}
 signer = TimestampSigner("your_secret_key")  # Replace with a secure secret key, perhaps from env
+playwright = None  # Global playwright instance
 
 logging.basicConfig(level=logging.INFO)
+
+@app.on_event("startup")
+async def startup_event():
+    global playwright
+    playwright = await async_playwright().start()
+    asyncio.create_task(clear_old_cache())
 
 def generate_random_string_from_session(session_id, length=10):
     # Deterministic random string based on session_id for sticky proxy per session
@@ -32,51 +40,64 @@ async def get_or_create_context(session_id: str):
         return contexts[session_id]
     # No is_connected check here; we'll handle closed contexts in the caller with try-except
 
-    async with async_playwright() as playwright:
-        # Generate deterministic random for sticky
-        random_str = generate_random_string_from_session(session_id)
-        username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
-        password = "pMBwu34BjjGr5urD"
-        proxy = {
-            "server": "http://pg.proxi.es:20000",
-            "username": username,
-            "password": password
+    # Generate deterministic random for sticky
+    random_str = generate_random_string_from_session(session_id)
+    username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
+    password = "pMBwu34BjjGr5urD"
+    proxy = {
+        "server": "http://pg.proxi.es:20000",
+        "username": username,
+        "password": password
+    }
+    logging.info(f"Launching browser context with proxy: http://{username}:*****@pg.proxi.es:20000")
+
+    # Test proxy with requests first
+    try:
+        proxies = {
+            "http": f"http://{username}:{password}@pg.proxi.es:20000",
+            "https": f"http://{username}:{password}@pg.proxi.es:20000"
         }
-        logging.info(f"Launching browser context with proxy: http://{username}:*****@pg.proxi.es:20000")
+        response = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=30)
+        logging.info(f"Proxy test success: IP {response.text.strip()}")
+    except Exception as e:
+        logging.error(f"Proxy test failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Proxy connection test failed: {str(e)}")
 
-        # Ensure sessions dir exists
-        os.makedirs(f"./sessions/{session_id}", exist_ok=True)
+    # Ensure sessions dir exists
+    os.makedirs(f"./sessions/{session_id}", exist_ok=True)
 
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=f"./sessions/{session_id}",
-            headless=True,
-            proxy=proxy,
-            args=[
-                '--disable-web-security',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-            ],
-            ignore_default_args=['--enable-automation'],
-            viewport={'width': 1920, 'height': 1080},
-            timezone_id="America/New_York",
-            locale="en-US",
-            java_script_enabled=True,
-        )
+    context = await playwright.chromium.launch_persistent_context(
+        user_data_dir=f"./sessions/{session_id}",
+        headless=True,
+        proxy=proxy,
+        args=[
+            '--disable-web-security',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+        ],
+        ignore_default_args=['--enable-automation'],
+        viewport={'width': 1920, 'height': 1080},
+        timezone_id="America/New_York",
+        locale="en-US",
+        java_script_enabled=True,
+        ignore_https_errors=True,  # Added to ignore SSL errors
+        service_workers='block',  # Added to block service workers if interfering
+    )
 
-        # JS overrides for WebRTC disable, timezone, language
-        await context.add_init_script("""
-            // Disable WebRTC
-            Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
-            Object.defineProperty(navigator, 'getUserMedia', { get: () => undefined });
-            // Already set timezone and locale via context options
-        """)
+    # JS overrides for WebRTC disable, timezone, language
+    await context.add_init_script("""
+        // Disable WebRTC
+        Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
+        Object.defineProperty(navigator, 'getUserMedia', { get: () => undefined });
+        // Already set timezone and locale via context options
+    """)
 
-        contexts[session_id] = context
-        return context
+    contexts[session_id] = context
+    return context
 
 async def pre_fetch_internal(request: Request, retry_count: int = 0):
     max_retries = 3
-    if retry_count > max_retries:
+    if retry_count >= max_retries:  # Fixed to >= to limit properly
         raise HTTPException(status_code=500, detail="Max retries exceeded for pre-fetch")
 
     try:
@@ -108,10 +129,10 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
                 del contexts[session_id]
                 return await pre_fetch_internal(request, retry_count + 1)
             else:
-                raise
+                raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logging.error(f"Pre-fetch critical error: {str(e)}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/pre-fetch")
 async def pre_fetch(request: Request):
@@ -119,7 +140,7 @@ async def pre_fetch(request: Request):
 
 async def scrape_internal(request: Request, retry_count: int = 0):
     max_retries = 3
-    if retry_count > max_retries:
+    if retry_count >= max_retries:  # Fixed to >=
         raise HTTPException(status_code=500, detail="Max retries exceeded for scrape")
 
     try:
@@ -241,12 +262,15 @@ async def middle():
 
 @app.on_event("shutdown")
 async def cleanup():
+    global playwright
     for session_id in list(contexts.keys()):
         try:
             await contexts[session_id].close()
         except Exception as e:
             logging.error(f"Shutdown: Error closing context for session {session_id}: {str(e)}")
     contexts.clear()
+    if playwright:
+        await playwright.stop()
 
 # Optional: Background task to clear old cache
 async def clear_old_cache():
@@ -256,7 +280,3 @@ async def clear_old_cache():
         for k in keys_to_delete:
             del cached_content[k]
         await asyncio.sleep(10)
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(clear_old_cache())
