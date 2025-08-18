@@ -29,20 +29,21 @@ async def get_or_create_context(session_id: str):
     # No is_connected check here; we'll handle closed contexts in the caller with try-except
 
     async with async_playwright() as playwright:
-        # Use fixed test username for now
-        username = f"KMwYgm4pR4upF6yX-s-test12345678-co-USA-st-NY-ci-NewYorkCity"
+        # Generate random session ID for sticky proxy
+        random_str = generate_random_string()
+        username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
         password = "pMBwu34BjjGr5urD"
         proxy = {
-            "server": "socks5://pg.proxi.es:20002",  # Keep socks5://
+            "server": "http://pg.proxi.es:20000",  # Switched to HTTP proxy
             "username": username,
             "password": password
         }
-        logging.info(f"Launching browser context with proxy: socks5://{username}:*****@pg.proxi.es:20002")
+        logging.info(f"Launching browser context with proxy: http://{username}:*****@pg.proxi.es:20000")
 
         # Ensure sessions dir exists
         os.makedirs(f"./sessions/{session_id}", exist_ok=True)
 
-        context = await playwright.firefox.launch_persistent_context(  # Changed to firefox
+        context = await playwright.chromium.launch_persistent_context(  # Back to chromium for HTTP support
             user_data_dir=f"./sessions/{session_id}",
             headless=True,
             proxy=proxy,
