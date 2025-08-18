@@ -12,6 +12,11 @@ from urllib.parse import urljoin, quote_plus
 from urllib.parse import urlparse
 import time
 from typing import Dict
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Fallback for FINAL_URL
 try:
@@ -45,10 +50,11 @@ USER_AGENTS = [
     'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
 ]
 
-# Generate random 10-char string for proxy username
 def generate_proxy_username():
     random_string = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-    return f"{BASE_USERNAME}{random_string}{USERNAME_SUFFIX}"
+    username = f"{BASE_USERNAME}{random_string}{USERNAME_SUFFIX}"
+    logger.info(f"Generated proxy username: {username}")
+    return username
 
 TIMEZONE_SPOOF_JS = f"""
   (function() {{
@@ -224,87 +230,138 @@ async def pre_fetch(request: Request):
     return JSONResponse({"status": "pre-fetch started"})
 
 async def _scrape_and_cache(session_id: str, url: str, user_agent: str):
-    async with async_playwright() as p:
-        if session_id not in contexts:
-            user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
-            os.makedirs(user_data_dir, exist_ok=True)
-            proxy_username = generate_proxy_username()
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=True,
-                proxy={"server": f"socks5://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
-                user_agent=user_agent,
-                viewport={'width': 390, 'height': 844} if 'mobile' in user_agent.lower() or 'iphone' in user_agent.lower() or 'android' in user_agent.lower() else {'width': 1920, 'height': 1080},
-                locale='en-US',
-                timezone_id=SPOOFED_TIMEZONE,
-                extra_http_headers={'Accept-Language': SPOOFED_LANGUAGE}
-            )
-            await context.add_init_script(script=f"""
-                Object.defineProperty(navigator, 'language', {{ get: () => 'en-US' }});
-                Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
-                Date.prototype.getTimezoneOffset = () => {SPOOFED_OFFSET};
-                const originalGetContext = HTMLCanvasElement.prototype.getContext;
-                HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
-                    if (type === 'webgl' || type === 'webgl2') {{
-                        attributes = {{ ...attributes, failIfMajorPerformanceCaveat: false }};
-                    }}
-                    return originalGetContext.call(this, type, attributes);
-                }};
-                Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
-                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
-                Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
-                window.RTCPeerConnection = null;
-                window.mozRTCPeerConnection = null;
-                window.webkitRTCPeerConnection = null;
-                window.RTCSessionDescription = null;
-                window.RTCIceCandidate = null;
-                navigator.getUserMedia = null;
-                navigator.mediaDevices = {{ getUserMedia: null }};
-                navigator.mozGetUserMedia = null;
-                navigator.webkitGetUserMedia = null;
-            """)
-            contexts[session_id] = context
+    try:
+        async with async_playwright() as p:
+            if session_id not in contexts:
+                user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
+                os.makedirs(user_data_dir, exist_ok=True)
+                proxy_username = generate_proxy_username()
+                logger.info(f"Launching browser context with proxy: socks5h://{proxy_username}:*****@{PROXY_HOST}:{PROXY_PORT}")
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=True,
+                    proxy={"server": f"socks5h://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
+                    user_agent=user_agent,
+                    viewport={'width': 390, 'height': 844} if 'mobile' in user_agent.lower() or 'iphone' in user_agent.lower() or 'android' in user_agent.lower() else {'width': 1920, 'height': 1080},
+                    locale='en-US',
+                    timezone_id=SPOOFED_TIMEZONE,
+                    extra_http_headers={'Accept-Language': SPOOFED_LANGUAGE}
+                )
+                await context.add_init_script(script=f"""
+                    Object.defineProperty(navigator, 'language', {{ get: () => 'en-US' }});
+                    Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+                    Date.prototype.getTimezoneOffset = () => {SPOOFED_OFFSET};
+                    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+                    HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
+                        if (type === 'webgl' || type === 'webgl2') {{
+                            attributes = {{ ...attributes, failIfMajorPerformanceCaveat: false }};
+                        }}
+                        return originalGetContext.call(this, type, attributes);
+                    }};
+                    Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+                    Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+                    window.RTCPeerConnection = null;
+                    window.mozRTCPeerConnection = null;
+                    window.webkitRTCPeerConnection = null;
+                    window.RTCSessionDescription = null;
+                    window.RTCIceCandidate = null;
+                    navigator.getUserMedia = null;
+                    navigator.mediaDevices = {{ getUserMedia: null }};
+                    navigator.mozGetUserMedia = null;
+                    navigator.webkitGetUserMedia = null;
+                """)
+                contexts[session_id] = context
+            else:
+                context = contexts[session_id]
 
-        context = contexts[session_id]
-        page = await context.new_page()
+            if not context.is_connected():
+                logger.error(f"Context for session {session_id} is closed. Creating new.")
+                del contexts[session_id]
+                user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
+                os.makedirs(user_data_dir, exist_ok=True)
+                proxy_username = generate_proxy_username()
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=True,
+                    proxy={"server": f"socks5h://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
+                    user_agent=user_agent,
+                    viewport={'width': 390, 'height': 844} if 'mobile' in user_agent.lower() or 'iphone' in user_agent.lower() or 'android' in user_agent.lower() else {'width': 1920, 'height': 1080},
+                    locale='en-US',
+                    timezone_id=SPOOFED_TIMEZONE,
+                    extra_http_headers={'Accept-Language': SPOOFED_LANGUAGE}
+                )
+                await context.add_init_script(script=f"""
+                    Object.defineProperty(navigator, 'language', {{ get: () => 'en-US' }});
+                    Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+                    Date.prototype.getTimezoneOffset = () => {SPOOFED_OFFSET};
+                    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+                    HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
+                        if (type === 'webgl' || type === 'webgl2') {{
+                            attributes = {{ ...attributes, failIfMajorPerformanceCaveat: false }};
+                        }}
+                        return originalGetContext.call(this, type, attributes);
+                    }};
+                    Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+                    Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+                    window.RTCPeerConnection = null;
+                    window.mozRTCPeerConnection = null;
+                    window.webkitRTCPeerConnection = null;
+                    window.RTCSessionDescription = null;
+                    window.RTCIceCandidate = null;
+                    navigator.getUserMedia = null;
+                    navigator.mediaDevices = {{ getUserMedia: null }};
+                    navigator.mozGetUserMedia = null;
+                    navigator.webkitGetUserMedia = null;
+                """)
+                contexts[session_id] = context
 
-        async def handle_response(resp):
-            headers = await resp.all_headers()
-            set_cookie = headers.get('set-cookie', '')
-            if set_cookie:
-                filtered = [c for c in set_cookie.split(';') if not any(geo in c.lower() for geo in GEO_COOKIES)]
-                print(f"Filtered cookies for {resp.url}: {filtered}")
+            page = await context.new_page()
 
-        page.on('response', handle_response)
+            async def handle_response(resp):
+                headers = await resp.all_headers()
+                set_cookie = headers.get('set-cookie', '')
+                if set_cookie:
+                    filtered = [c for c in set_cookie.split(';') if not any(geo in c.lower() for geo in GEO_COOKIES)]
+                    logger.info(f"Filtered cookies for {resp.url}: {filtered}")
 
-        try:
-            await page.goto(url, wait_until='networkidle', timeout=60000)
-            await asyncio.sleep(random.uniform(2, 5))
-            content = await page.content()
+            page.on('response', handle_response)
 
-            soup = BeautifulSoup(content, 'lxml')
-            for tag in soup.find_all(['a', 'form'], href=True):
-                original_url = tag['href']
-                full_url = urljoin(url, original_url)
-                tag['href'] = f'/scrape?url={quote_plus(full_url)}&session_id={session_id}'
-            if soup.html:
-                soup.html['lang'] = 'en-US'
-            if soup.head:
-                timezone_script = soup.new_tag('script')
-                timezone_script.string = TIMEZONE_SPOOF_JS
-                soup.head.append(timezone_script)
-                proxy_script = soup.new_tag('script')
-                proxy_script.string = PROXY_JS_OVERRIDE
-                soup.head.append(proxy_script)
+            try:
+                logger.info(f"Navigating to {url} with session {session_id}")
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+                await asyncio.sleep(random.uniform(2, 5))
+                content = await page.content()
 
-            rewritten_content = str(soup)
-            cached_content[session_id] = rewritten_content
-            await asyncio.sleep(30)
-            if session_id in cached_content:
-                del cached_content[session_id]
-        except Exception as e:
-            cached_content[session_id] = f"Pre-fetch failed: {str(e)}. Please try again."
-            print(f"Pre-fetch error: {str(e)}")
+                soup = BeautifulSoup(content, 'lxml')
+                for tag in soup.find_all(['a', 'form'], href=True):
+                    original_url = tag['href']
+                    full_url = urljoin(url, original_url)
+                    tag['href'] = f'/scrape?url={quote_plus(full_url)}&session_id={session_id}'
+                if soup.html:
+                    soup.html['lang'] = 'en-US'
+                if soup.head:
+                    timezone_script = soup.new_tag('script')
+                    timezone_script.string = TIMEZONE_SPOOF_JS
+                    soup.head.append(timezone_script)
+                    proxy_script = soup.new_tag('script')
+                    proxy_script.string = PROXY_JS_OVERRIDE
+                    soup.head.append(proxy_script)
+
+                rewritten_content = str(soup)
+                cached_content[session_id] = rewritten_content
+                logger.info(f"Cached content for session {session_id}")
+                await asyncio.sleep(30)
+                if session_id in cached_content:
+                    del cached_content[session_id]
+                    logger.info(f"Cleared cache for session {session_id}")
+            except Exception as e:
+                cached_content[session_id] = f"Pre-fetch failed: {str(e)}. Please try again."
+                logger.error(f"Pre-fetch error: {str(e)}")
+    except Exception as e:
+        cached_content[session_id] = f"Pre-fetch failed: {str(e)}. Please try again."
+        logger.error(f"Pre-fetch critical error: {str(e)}")
 
 @app.get("/scrape")
 async def scrape_get(request: Request, response: Response, url: str):
@@ -328,16 +385,11 @@ async def scrape_post(request: Request, response: Response):
     if not session_id:
         return HTMLResponse("Error: No session. Please start from /middle.")
 
-    body = await request.json()
-    url = body.get('url', FINAL_URL)
-
-    if session_id in cached_content:
-        content = cached_content[session_id]
-        del cached_content[session_id]
-        if content.startswith("Pre-fetch failed"):
-            pass
-        else:
-            return content
+    try:
+        body = await request.json()
+        url = body.get('url', FINAL_URL)
+    except Exception:
+        return HTMLResponse("Error: Invalid request body. Please try again.")
 
     return await scrape(request, response, url)
 
@@ -348,96 +400,146 @@ async def scrape(request: Request, response: Response, url: str):
     is_mobile = 'mobile' in user_agent.lower() or 'iphone' in user_agent.lower() or 'android' in user_agent.lower()
     viewport = {'width': 390, 'height': 844} if is_mobile else {'width': 1920, 'height': 1080}
 
-    async with async_playwright() as p:
-        if session_id not in contexts:
-            user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
-            os.makedirs(user_data_dir, exist_ok=True)
-            proxy_username = generate_proxy_username()
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=True,
-                proxy={"server": f"socks5://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
-                user_agent=user_agent,
-                viewport=viewport,
-                locale='en-US',
-                timezone_id=SPOOFED_TIMEZONE,
-                extra_http_headers={'Accept-Language': SPOOFED_LANGUAGE}
-            )
-            await context.add_init_script(script=f"""
-                Object.defineProperty(navigator, 'language', {{ get: () => 'en-US' }});
-                Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
-                Date.prototype.getTimezoneOffset = () => {SPOOFED_OFFSET};
-                const originalGetContext = HTMLCanvasElement.prototype.getContext;
-                HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
-                    if (type === 'webgl' || type === 'webgl2') {{
-                        attributes = {{ ...attributes, failIfMajorPerformanceCaveat: false }};
-                    }}
-                    return originalGetContext.call(this, type, attributes);
-                }};
-                Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
-                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
-                Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
-                window.RTCPeerConnection = null;
-                window.mozRTCPeerConnection = null;
-                window.webkitRTCPeerConnection = null;
-                window.RTCSessionDescription = null;
-                window.RTCIceCandidate = null;
-                navigator.getUserMedia = null;
-                navigator.mediaDevices = {{ getUserMedia: null }};
-                navigator.mozGetUserMedia = null;
-                navigator.webkitGetUserMedia = null;
-            """)
-            contexts[session_id] = context
-        else:
-            context = contexts[session_id]
-
-        page = await context.new_page()
-
-        async def handle_response(resp):
-            headers = await resp.all_headers()
-            set_cookie = headers.get('set-cookie', '')
-            if set_cookie:
-                filtered = [c for c in set_cookie.split(';') if not any(geo in c.lower() for geo in GEO_COOKIES)]
-                print(f"Filtered cookies for {resp.url}: {filtered}")
-
-        page.on('response', handle_response)
-
-        await context.add_cookies([{'name': k, 'value': v, 'domain': urlparse(url).hostname, 'path': '/'} for k, v in cookies.items()])
-
-        try:
-            await page.goto(url, wait_until='networkidle', timeout=60000)
-            await asyncio.sleep(random.uniform(2, 5))
-            content = await page.content()
-
-            soup = BeautifulSoup(content, 'lxml')
-            for tag in soup.find_all(['a', 'form'], href=True):
-                original_url = tag['href']
-                full_url = urljoin(url, original_url)
-                tag['href'] = f'/scrape?url={quote_plus(full_url)}&session_id={session_id}'
-            if soup.html:
-                soup.html['lang'] = 'en-US'
-            if soup.head:
-                timezone_script = soup.new_tag('script')
-                timezone_script.string = TIMEZONE_SPOOF_JS
-                soup.head.append(timezone_script)
-                proxy_script = soup.new_tag('script')
-                proxy_script.string = PROXY_JS_OVERRIDE
-                soup.head.append(proxy_script)
-
-            rewritten_content = str(soup)
-        except Exception as e:
-            if 'proxy' in str(e).lower() or 'expire' in str(e).lower():
-                rewritten_content = "Proxy expired or error. Session ended - reload to start new session."
+    try:
+        async with async_playwright() as p:
+            if session_id not in contexts:
+                user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
+                os.makedirs(user_data_dir, exist_ok=True)
+                proxy_username = generate_proxy_username()
+                logger.info(f"Launching browser context for scrape with proxy: socks5h://{proxy_username}:*****@{PROXY_HOST}:{PROXY_PORT}")
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=True,
+                    proxy={"server": f"socks5h://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
+                    user_agent=user_agent,
+                    viewport=viewport,
+                    locale='en-US',
+                    timezone_id=SPOOFED_TIMEZONE,
+                    extra_http_headers={'Accept-Language': SPOOFED_LANGUAGE}
+                )
+                await context.add_init_script(script=f"""
+                    Object.defineProperty(navigator, 'language', {{ get: () => 'en-US' }});
+                    Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+                    Date.prototype.getTimezoneOffset = () => {SPOOFED_OFFSET};
+                    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+                    HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
+                        if (type === 'webgl' || type === 'webgl2') {{
+                            attributes = {{ ...attributes, failIfMajorPerformanceCaveat: false }};
+                        }}
+                        return originalGetContext.call(this, type, attributes);
+                    }};
+                    Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+                    Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+                    window.RTCPeerConnection = null;
+                    window.mozRTCPeerConnection = null;
+                    window.webkitRTCPeerConnection = null;
+                    window.RTCSessionDescription = null;
+                    window.RTCIceCandidate = null;
+                    navigator.getUserMedia = null;
+                    navigator.mediaDevices = {{ getUserMedia: null }};
+                    navigator.mozGetUserMedia = null;
+                    navigator.webkitGetUserMedia = null;
+                """)
+                contexts[session_id] = context
             else:
-                rewritten_content = f"Error scraping: {str(e)}. Please try again."
-        finally:
-            return rewritten_content
+                context = contexts[session_id]
+
+            if not context.is_connected():
+                logger.error(f"Context for session {session_id} is closed. Creating new.")
+                del contexts[session_id]
+                user_data_dir = os.path.join(os.getcwd(), f'temp_profile_{session_id}')
+                os.makedirs(user_data_dir, exist_ok=True)
+                proxy_username = generate_proxy_username()
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=True,
+                    proxy={"server": f"socks5h://{proxy_username}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"},
+                    user_agent=user_agent,
+                    viewport=viewport,
+                    locale='en-US',
+                    timezone_id=SPOOFED_TIMEZONE,
+                    extra_http_headers={'Accept-Language': SPOOFED_LANGUAGE}
+                )
+                await context.add_init_script(script=f"""
+                    Object.defineProperty(navigator, 'language', {{ get: () => 'en-US' }});
+                    Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+                    Date.prototype.getTimezoneOffset = () => {SPOOFED_OFFSET};
+                    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+                    HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
+                        if (type === 'webgl' || type === 'webgl2') {{
+                            attributes = {{ ...attributes, failIfMajorPerformanceCaveat: false }};
+                        }}
+                        return originalGetContext.call(this, type, attributes);
+                    }};
+                    Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+                    Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+                    window.RTCPeerConnection = null;
+                    window.mozRTCPeerConnection = null;
+                    window.webkitRTCPeerConnection = null;
+                    window.RTCSessionDescription = null;
+                    window.RTCIceCandidate = null;
+                    navigator.getUserMedia = null;
+                    navigator.mediaDevices = {{ getUserMedia: null }};
+                    navigator.mozGetUserMedia = null;
+                    navigator.webkitGetUserMedia = null;
+                """)
+                contexts[session_id] = context
+
+            page = await context.new_page()
+
+            async def handle_response(resp):
+                headers = await resp.all_headers()
+                set_cookie = headers.get('set-cookie', '')
+                if set_cookie:
+                    filtered = [c for c in set_cookie.split(';') if not any(geo in c.lower() for geo in GEO_COOKIES)]
+                    logger.info(f"Filtered cookies for {resp.url}: {filtered}")
+
+            page.on('response', handle_response)
+
+            try:
+                await context.add_cookies([{'name': k, 'value': v, 'domain': urlparse(url).hostname, 'path': '/'} for k, v in cookies.items()])
+                logger.info(f"Navigating to {url} for session {session_id}")
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+                await asyncio.sleep(random.uniform(2, 5))
+                content = await page.content()
+
+                soup = BeautifulSoup(content, 'lxml')
+                for tag in soup.find_all(['a', 'form'], href=True):
+                    original_url = tag['href']
+                    full_url = urljoin(url, original_url)
+                    tag['href'] = f'/scrape?url={quote_plus(full_url)}&session_id={session_id}'
+                if soup.html:
+                    soup.html['lang'] = 'en-US'
+                if soup.head:
+                    timezone_script = soup.new_tag('script')
+                    timezone_script.string = TIMEZONE_SPOOF_JS
+                    soup.head.append(timezone_script)
+                    proxy_script = soup.new_tag('script')
+                    proxy_script.string = PROXY_JS_OVERRIDE
+                    soup.head.append(proxy_script)
+
+                rewritten_content = str(soup)
+                return rewritten_content
+            except Exception as e:
+                logger.error(f"Scrape error for {url}: {str(e)}")
+                if 'proxy' in str(e).lower() or 'expire' in str(e).lower():
+                    return HTMLResponse("Proxy error: Connection failed. Please check credentials or try again later.")
+                return HTMLResponse(f"Error scraping: {str(e)}. Please try again.")
+    except Exception as e:
+        logger.error(f"Critical scrape error for {url}: {str(e)}")
+        return HTMLResponse(f"Critical error: {str(e)}. Please try again.")
 
 @app.get("/close_session")
 async def close_session(request: Request):
     session_id = request.session.get('session_id')
     if session_id in contexts:
-        await contexts[session_id].close()
+        try:
+            await contexts[session_id].close()
+            logger.info(f"Closed context for session {session_id}")
+        except Exception as e:
+            logger.error(f"Error closing context for session {session_id}: {str(e)}")
         del contexts[session_id]
     if session_id in cached_content:
         del cached_content[session_id]
@@ -446,8 +548,12 @@ async def close_session(request: Request):
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    for context in list(contexts.values()):
-        await context.close()
+    for session_id, context in list(contexts.items()):
+        try:
+            await context.close()
+            logger.info(f"Shutdown: Closed context for session {session_id}")
+        except Exception as e:
+            logger.error(f"Shutdown: Error closing context for session {session_id}: {str(e)}")
     contexts.clear()
     cached_content.clear()
 
