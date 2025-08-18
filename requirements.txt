@@ -5,3 +5,4 @@ lxml==4.9.3
 python-socks==2.4.4
 starlette==0.27.0
 itsdangerous==2.2.0
+playwright==1.40.0
