@@ -141,13 +141,78 @@ async def scrape(request: Request):
 
 @app.get("/middle", response_class=HTMLResponse)
 async def middle():
-    # Assuming middle.html is a file in the repo; read it
-    try:
-        with open("middle.html", "r") as f:
-            html_content = f.read()
-        return HTMLResponse(content=html_content)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="middle.html not found")
+    # Hardcoded middle.html content to avoid FileNotFoundError
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Middle Page</title>
+        <script>
+            window.onload = function() {
+                let sessionId = localStorage.getItem('sessionId');
+                if (!sessionId) {
+                    sessionId = Date.now().toString();
+                    localStorage.setItem('sessionId', sessionId);
+                }
+                const userAgent = navigator.userAgent;
+                const cookies = document.cookie.split(';').map(c => {
+                    const [name, ...valueParts] = c.trim().split('=');
+                    const value = valueParts.join('=');
+                    return {name, value, domain: location.hostname, path: '/'};
+                });
+                fetch('/pre-fetch', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({userAgent, cookies, sessionId})
+                }).then(response => {
+                    if (!response.ok) {
+                        throw new Error('Pre-fetch failed');
+                    }
+                }).catch(error => {
+                    document.getElementById('error').innerText = 'Failed to load content. Click Proceed to try again.';
+                    document.getElementById('error').style.display = 'block';
+                });
+            };
+        </script>
+    </head>
+    <body>
+        <h1>Welcome to the Middle Page</h1>
+        <p>Click Proceed to load the target site via proxy.</p>
+        <button id="proceedButton">Proceed</button>
+        <div id="error" style="color: red; display: none;"></div>
+        <script>
+            document.getElementById('proceedButton').addEventListener('click', function() {
+                const sessionId = localStorage.getItem('sessionId');
+                const userAgent = navigator.userAgent;
+                const cookies = document.cookie.split(';').map(c => {
+                    const [name, ...valueParts] = c.trim().split('=');
+                    const value = valueParts.join('=');
+                    return {name, value, domain: location.hostname, path: '/'};
+                });
+                fetch('/scrape', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({sessionId, userAgent, cookies})
+                }).then(response => {
+                    if (response.ok) {
+                        return response.text();
+                    }
+                    throw new Error('Scrape failed');
+                }).then(content => {
+                    document.open();
+                    document.write(content);
+                    document.close();
+                }).catch(error => {
+                    document.getElementById('error').innerText = 'Error loading content: ' + error.message;
+                    document.getElementById('error').style.display = 'block';
+                });
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 @app.on_event("shutdown")
 async def cleanup():
