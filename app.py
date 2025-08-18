@@ -36,7 +36,7 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'  # Added iPhone for testing
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
 ]
 
 # Timezone Spoof JS
@@ -299,9 +299,8 @@ async def scrape(request: Request, response: Response, url: str):
             else:
                 rewritten_content = f"Error scraping: {str(e)}"
         finally:
-            # Don't close page/context - reuse
-
-    return rewritten_content
+            # Fixed: Indent return correctly under finally
+            return rewritten_content
 
 @app.get("/close_session")
 async def close_session(request: Request):
