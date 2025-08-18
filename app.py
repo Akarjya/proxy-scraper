@@ -33,7 +33,7 @@ async def get_or_create_context(session_id: str):
         username = f"KMwYgm4pR4upF6yX-s-test12345678-co-USA-st-NY-ci-NewYorkCity"
         password = "pMBwu34BjjGr5urD"
         proxy = {
-            "server": "socks5://pg.proxi.es:20002",  # Changed to socks5:// for compatibility
+            "server": "socks5://pg.proxi.es:20002",  # Keep socks5://
             "username": username,
             "password": password
         }
@@ -42,13 +42,12 @@ async def get_or_create_context(session_id: str):
         # Ensure sessions dir exists
         os.makedirs(f"./sessions/{session_id}", exist_ok=True)
 
-        context = await playwright.chromium.launch_persistent_context(
+        context = await playwright.firefox.launch_persistent_context(  # Changed to firefox
             user_data_dir=f"./sessions/{session_id}",
             headless=True,
             proxy=proxy,
             args=[
                 '--disable-web-security',
-                '--host-resolver-rules=MAP * 0.0.0.0 , EXCLUDE pg.proxi.es',  # For DNS over SOCKS
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
             ],
