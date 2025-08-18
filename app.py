@@ -4,6 +4,7 @@ import string
 import time
 import asyncio
 import os
+import hashlib  # For deterministic random based on session_id
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,7 +21,10 @@ signer = TimestampSigner("your_secret_key")  # Replace with a secure secret key,
 
 logging.basicConfig(level=logging.INFO)
 
-def generate_random_string(length=10):
+def generate_random_string_from_session(session_id, length=10):
+    # Deterministic random string based on session_id for sticky proxy per session
+    seed = int(hashlib.sha256(session_id.encode()).hexdigest(), 16)
+    random.seed(seed)
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 async def get_or_create_context(session_id: str):
@@ -29,12 +33,12 @@ async def get_or_create_context(session_id: str):
     # No is_connected check here; we'll handle closed contexts in the caller with try-except
 
     async with async_playwright() as playwright:
-        # Generate random session ID for sticky proxy
-        random_str = generate_random_string()
+        # Generate deterministic random for sticky
+        random_str = generate_random_string_from_session(session_id)
         username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
         password = "pMBwu34BjjGr5urD"
         proxy = {
-            "server": "http://pg.proxi.es:20000",  # Switched to HTTP proxy
+            "server": "http://pg.proxi.es:20000",
             "username": username,
             "password": password
         }
@@ -43,7 +47,7 @@ async def get_or_create_context(session_id: str):
         # Ensure sessions dir exists
         os.makedirs(f"./sessions/{session_id}", exist_ok=True)
 
-        context = await playwright.chromium.launch_persistent_context(  # Back to chromium for HTTP support
+        context = await playwright.chromium.launch_persistent_context(
             user_data_dir=f"./sessions/{session_id}",
             headless=True,
             proxy=proxy,
@@ -70,8 +74,11 @@ async def get_or_create_context(session_id: str):
         contexts[session_id] = context
         return context
 
-@app.post("/pre-fetch")
-async def pre_fetch(request: Request):
+async def pre_fetch_internal(request: Request, retry_count: int = 0):
+    max_retries = 3
+    if retry_count > max_retries:
+        raise HTTPException(status_code=500, detail="Max retries exceeded for pre-fetch")
+
     try:
         data = await request.json()
         user_agent = data.get('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
@@ -84,26 +91,37 @@ async def pre_fetch(request: Request):
 
         try:
             page = await context.new_page()
+            # Log browser errors
+            page.on("pageerror", lambda err: logging.error(f"Page error: {err}"))
+            page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
             await page.set_extra_http_headers({'User-Agent': user_agent})
             await context.add_cookies(cookies)  # Add cookies to context
-            await page.goto(FINAL_URL, timeout=60000)  # Increased timeout
+            await page.goto(FINAL_URL, timeout=120000)  # Increased timeout
             content = await page.content()
             await page.close()
             cached_content[session_id] = {'content': content, 'timestamp': time.time()}
             return {"status": "success"}
         except PlaywrightError as e:
+            logging.error(f"PlaywrightError during pre-fetch: {str(e)}")
             if 'TargetClosedError' in str(e) or 'closed' in str(e).lower():
-                logging.error(f"Context closed during pre-fetch, recreating for session {session_id}")
+                logging.error(f"Context closed during pre-fetch, recreating for session {session_id} (retry {retry_count + 1}/{max_retries})")
                 del contexts[session_id]
-                return await pre_fetch(request)  # Retry once
+                return await pre_fetch_internal(request, retry_count + 1)
             else:
                 raise
     except Exception as e:
         logging.error(f"Pre-fetch critical error: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.post("/scrape")
-async def scrape(request: Request):
+@app.post("/pre-fetch")
+async def pre_fetch(request: Request):
+    return await pre_fetch_internal(request)
+
+async def scrape_internal(request: Request, retry_count: int = 0):
+    max_retries = 3
+    if retry_count > max_retries:
+        raise HTTPException(status_code=500, detail="Max retries exceeded for scrape")
+
     try:
         data = await request.json()
         session_id = data.get('sessionId')
@@ -119,25 +137,32 @@ async def scrape(request: Request):
         cookies = data.get('cookies', [])
 
         page = await context.new_page()
+        # Log browser errors
+        page.on("pageerror", lambda err: logging.error(f"Page error: {err}"))
+        page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
         await page.set_extra_http_headers({'User-Agent': user_agent})
         await context.add_cookies(cookies)
-        await page.goto(FINAL_URL, timeout=60000)
+        await page.goto(FINAL_URL, timeout=120000)
         content = await page.content()
         await page.close()
 
         cached_content[session_id] = {'content': content, 'timestamp': time.time()}
         return HTMLResponse(content=content)
     except PlaywrightError as e:
+        logging.error(f"PlaywrightError during scrape: {str(e)}")
         if 'TargetClosedError' in str(e) or 'closed' in str(e).lower():
-            logging.error(f"Context closed during scrape, recreating for session {session_id}")
+            logging.error(f"Context closed during scrape, recreating for session {session_id} (retry {retry_count + 1}/{max_retries})")
             del contexts[session_id]
-            return await scrape(request)  # Retry once
+            return await scrape_internal(request, retry_count + 1)
         else:
-            logging.error(f"Critical scrape error for {FINAL_URL}: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logging.error(f"Critical scrape error for {FINAL_URL}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/scrape")
+async def scrape(request: Request):
+    return await scrape_internal(request)
 
 @app.get("/middle", response_class=HTMLResponse)
 async def middle():
