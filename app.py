@@ -118,10 +118,10 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
             page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
             await page.set_extra_http_headers({'User-Agent': user_agent})
             await context.add_cookies(cookies)  # Add cookies to context
-            await page.goto(FINAL_URL, timeout=180000)  # Increased to 3min
+            await page.goto(FINAL_URL, timeout=180000)  # Increased timeout
             await page.wait_for_load_state('networkidle')
-            # Wait for IP to load
-            await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
+            # Wait for IP to load (for whatismyip.com, adjust to '#ip' or similar if needed)
+            await page.wait_for_function('() => document.querySelector("#ip") && document.querySelector("#ip").innerText !== ""', timeout=60000)
             content = await page.content()
             # Rewrite URLs
             content = rewrite_urls(content, session_id, FINAL_URL)
@@ -172,7 +172,7 @@ async def scrape_internal(request: Request, retry_count: int = 0):
         await page.goto(FINAL_URL, timeout=180000)  # Increased
         await page.wait_for_load_state('networkidle')
         # Wait for IP to load
-        await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
+        await page.wait_for_function('() => document.querySelector("#ip") && document.querySelector("#ip").innerText !== ""', timeout=60000)
         content = await page.content()
         # Rewrite URLs
         content = rewrite_urls(content, session_id, FINAL_URL)
@@ -201,7 +201,7 @@ def rewrite_urls(content: str, session_id: str, base_url: str) -> str:
     base = base_url.rsplit('/', 1)[0] + '/'  # For relative to absolute
 
     for tag in soup.find_all(True):
-        for attr in ['src', 'href', 'action', 'data-src', 'poster', 'data-background', 'srcset']:
+        for attr in ['src', 'href', 'action', 'data-src', 'poster', 'data-background', 'srcset', 'data-lazy-src']:
             if attr in tag.attrs:
                 original = tag[attr]
                 if original and not original.startswith('data:') and not original.startswith('#'):
