@@ -8,3 +8,4 @@ starlette
 itsdangerous
 python-multipart
 requests
+playwright-stealth
