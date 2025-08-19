@@ -1,1 +1,1 @@
-FINAL_URL = "https://www.whatismyip.com/"
+FINAL_URL = "https://iplocation.io/"
