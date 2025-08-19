@@ -1,347 +1,217 @@
 import logging
 import random
-import string
+import json
 import time
 import asyncio
-import os
-import hashlib  # For deterministic random based on session_id
-import requests  # For proxy test and resource proxy
-from urllib.parse import quote, urljoin
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-from playwright.async_api import async_playwright, Error as PlaywrightError
-from itsdangerous import TimestampSigner
+import requests
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import HTMLResponse
+from starlette.responses import Response
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 from bs4 import BeautifulSoup
-
 from config import FINAL_URL
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
-contexts = {}
 cached_content = {}
-signer = TimestampSigner("your_secret_key")  # Replace with a secure secret key, perhaps from env
-playwright = None  # Global playwright instance
+playwright = None
 
-logging.basicConfig(level=logging.INFO)
+PROXY_USERNAME = "KMwYgm4pR4upF6yX-s-OHIAjmD24A-co-USA-st-NY-ci-NewYorkCity"  # From your logs; includes geo for sticky NY proxies
+PROXY_PASSWORD = "pMBwu34BjjGr5urD"
+PROXY_SERVER = "pg.proxi.es:20000"  # From your logs; update if needed
 
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     global playwright
     playwright = await async_playwright().start()
-    asyncio.create_task(clear_old_cache())
 
-def generate_random_string_from_session(session_id, length=10):
-    # Deterministic random string based on session_id for sticky proxy per session
-    seed = int(hashlib.sha256(session_id.encode()).hexdigest(), 16)
-    random.seed(seed)
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+@app.on_event("shutdown")
+async def shutdown():
+    await playwright.stop()
 
-async def get_or_create_context(session_id: str):
-    if session_id in contexts:
-        return contexts[session_id]
-
-    # Generate deterministic random for sticky
-    random_str = generate_random_string_from_session(session_id)
-    username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
-    password = "pMBwu34BjjGr5urD"
-    proxy = {
-        "server": "http://pg.proxi.es:20000",
-        "username": username,
-        "password": password
-    }
-    logging.info(f"Launching browser context with proxy: http://{username}:*****@pg.proxi.es:20000")
-
-    # Test proxy with requests first
-    try:
-        proxies = {
-            "http": f"http://{username}:{password}@pg.proxi.es:20000",
-            "https": f"http://{username}:{password}@pg.proxi.es:20000"
-        }
-        response = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=30)
-        logging.info(f"Proxy test success: IP {response.text.strip()}")
-    except Exception as e:
-        logging.error(f"Proxy test failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Proxy connection test failed: {str(e)}")
-
-    # Ensure sessions dir exists
-    os.makedirs(f"./sessions/{session_id}", exist_ok=True)
-
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=f"./sessions/{session_id}",
-        headless=True,
-        proxy=proxy,
-        args=[
-            '--disable-web-security',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-        ],
-        ignore_default_args=['--enable-automation'],
-        viewport={'width': 1920, 'height': 1080},
-        timezone_id="America/New_York",
-        locale="en-US",
-        java_script_enabled=True,
-        ignore_https_errors=True,  # Ignore SSL errors
-        service_workers='block',  # Block service workers if interfering
-    )
-
-    # JS overrides for WebRTC disable, timezone, language
-    await context.add_init_script("""
-        // Disable WebRTC
-        Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
-        Object.defineProperty(navigator, 'getUserMedia', { get: () => undefined });
-        // Already set timezone and locale via context options
-    """)
-
-    contexts[session_id] = context
-    return context
-
-async def pre_fetch_internal(request: Request, retry_count: int = 0):
-    max_retries = 3
-    if retry_count >= max_retries:
-        raise HTTPException(status_code=500, detail="Max retries exceeded for pre-fetch")
-
-    try:
-        data = await request.json()
-        user_agent = data.get('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-        cookies = data.get('cookies', [])  # Expect list of dicts {name, value, domain, etc.}
-        session_id = data.get('sessionId')  # Assume sent from JS; if not, generate
-        if not session_id:
-            session_id = signer.sign(str(time.time())).decode('utf-8')
-
-        context = await get_or_create_context(session_id)
-
-        try:
-            page = await context.new_page()
-            # Log browser errors
-            page.on("pageerror", lambda err: logging.error(f"Page error: {err}"))
-            page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
-            await page.set_extra_http_headers({'User-Agent': user_agent})
-            await context.add_cookies(cookies)  # Add cookies to context
-            await page.goto(FINAL_URL, timeout=180000)
-            await page.wait_for_load_state('networkidle')
-            # Wait for IP to load (for whatismyipaddress.com, selector '#ipv4')
-            await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not detected"', timeout=60000)
-            content = await page.content()
-            # Rewrite URLs
-            content = rewrite_urls(content, session_id, FINAL_URL)
-            await page.close()
-            cached_content[session_id] = {'content': content, 'timestamp': time.time()}
-            return {"status": "success"}
-        except PlaywrightError as e:
-            logging.error(f"PlaywrightError during pre-fetch: {str(e)}")
-            if 'TargetClosedError' in str(e) or 'closed' in str(e).lower():
-                logging.error(f"Context closed during pre-fetch, recreating for session {session_id} (retry {retry_count + 1}/{max_retries})")
-                del contexts[session_id]
-                return await pre_fetch_internal(request, retry_count + 1)
-            else:
-                raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logging.error(f"Pre-fetch critical error: {str(e)}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.post("/pre-fetch")
-async def pre_fetch(request: Request):
-    return await pre_fetch_internal(request)
-
-async def scrape_internal(request: Request, retry_count: int = 0):
-    max_retries = 3
-    if retry_count >= max_retries:
-        raise HTTPException(status_code=500, detail="Max retries exceeded for scrape")
-
-    try:
-        data = await request.json()
-        session_id = data.get('sessionId')
-        if not session_id:
-            raise HTTPException(status_code=400, detail="Missing sessionId")
-
-        if session_id in cached_content and time.time() - cached_content[session_id]['timestamp'] < 30:
-            return HTMLResponse(content=cached_content[session_id]['content'])
-
-        context = await get_or_create_context(session_id)
-
-        user_agent = data.get('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-        cookies = data.get('cookies', [])
-
-        page = await context.new_page()
-        # Log browser errors
-        page.on("pageerror", lambda err: logging.error(f"Page error: {err}"))
-        page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
-        await page.set_extra_http_headers({'User-Agent': user_agent})
-        await context.add_cookies(cookies)
-        await page.goto(FINAL_URL, timeout=180000)
-        await page.wait_for_load_state('networkidle')
-        # Wait for IP to load
-        await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not detected"', timeout=60000)
-        content = await page.content()
-        # Rewrite URLs
-        content = rewrite_urls(content, session_id, FINAL_URL)
-        await page.close()
-
-        cached_content[session_id] = {'content': content, 'timestamp': time.time()}
-        return HTMLResponse(content=content)
-    except PlaywrightError as e:
-        logging.error(f"PlaywrightError during scrape: {str(e)}")
-        if 'TargetClosedError' in str(e) or 'closed' in str(e).lower():
-            logging.error(f"Context closed during scrape, recreating for session {session_id} (retry {retry_count + 1}/{max_retries})")
-            del contexts[session_id]
-            return await scrape_internal(request, retry_count + 1)
-        else:
-            raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logging.error(f"Critical scrape error for {FINAL_URL}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/scrape")
-async def scrape(request: Request):
-    return await scrape_internal(request)
-
-def rewrite_urls(content: str, session_id: str, base_url: str) -> str:
-    soup = BeautifulSoup(content, 'lxml')
-    base = base_url.rsplit('/', 1)[0] + '/'  # For relative to absolute
-
-    for tag in soup.find_all(True):
-        for attr in ['src', 'href', 'action', 'data-src', 'poster', 'data-background', 'srcset', 'data-lazy-src']:
-            if attr in tag.attrs:
-                original = tag[attr]
-                if original and not original.startswith('data:') and not original.startswith('#'):
-                    # Make absolute
-                    if not original.startswith('http'):
-                        original = urljoin(base, original)
-                    tag[attr] = f"/resource?session_id={session_id}&url={quote(original)}"
-
-    # For style urls
-    for tag in soup.find_all('style'):
-        if tag.string:
-            tag.string = tag.string.replace('url(', 'url(/resource?session_id=' + session_id + '&url=')
-
-    # For inline scripts with fetch/API calls
-    for tag in soup.find_all('script'):
-        if tag.string:
-            tag.string = tag.string.replace('https://api.iplocation.io/', '/resource?session_id=' + session_id + '&url=https%3A%2F%2Fapi.iplocation.io%2F')
-            tag.string = tag.string.replace('https://ex.ingage.tech/', '/resource?session_id=' + session_id + '&url=https%3A%2F%2Fex.ingage.tech%2F')
-
-    return str(soup)
-
-@app.get("/resource")
-async def proxy_resource(session_id: str, url: str, request: Request):
-    if not session_id or not url:
-        raise HTTPException(status_code=400, detail="Missing parameters")
-
-    # Get username from session_id
-    random_str = generate_random_string_from_session(session_id)
-    username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
-    password = "pMBwu34BjjGr5urD"
-    proxy_url = f"http://{username}:{password}@pg.proxi.es:20000"
-
-    proxies = {"http": proxy_url, "https": proxy_url}
-
-    headers = dict(request.headers)  # Forward user headers
-    headers.pop('host', None)
-    headers.pop('content-length', None)
-
-    try:
-        resp = requests.get(url, proxies=proxies, headers=headers, stream=True, timeout=30)
-        resp.raise_for_status()
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        response_headers = {name: value for name, value in resp.headers.items() if name.lower() not in excluded_headers}
-        return Response(content=resp.content, status_code=resp.status_code, headers=response_headers)
-    except Exception as e:
-        logging.error(f"Resource proxy error for {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+MIDDLE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Middle Page</title>
+</head>
+<body>
+    <h1>Welcome to the Middle Page</h1>
+    <p>Click the button to proceed to the target site.</p>
+    <form id="proceedForm" method="POST" action="/scrape">
+        <button type="submit">Proceed</button>
+    </form>
+    <div id="error" style="color: red;"></div>
+    <iframe id="contentFrame" sandbox="allow-scripts" style="width:100%; height:100vh; border:none;"></iframe>
+    <script>
+        const userData = {
+            user_agent: navigator.userAgent,
+            cookies: document.cookie
+        };
+        // Pre-fetch on load
+        window.addEventListener('load', () => {
+            fetch('/pre-fetch', {
+                method: 'POST',
+                body: JSON.stringify(userData),
+                headers: {'Content-Type': 'application/json'}
+            }).then(response => {
+                if (!response.ok) {
+                    document.getElementById('error').textContent = 'Pre-fetch failed.';
+                }
+            }).catch(error => {
+                document.getElementById('error').textContent = 'Error: ' + error;
+            });
+        });
+        // Proceed button
+        document.getElementById('proceedForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            fetch('/scrape', {
+                method: 'POST',
+                body: JSON.stringify(userData),
+                headers: {'Content-Type': 'application/json'}
+            }).then(response => response.json())
+            .then(data => {
+                if (data.content) {
+                    document.getElementById('contentFrame').srcdoc = data.content;
+                } else {
+                    document.getElementById('error').textContent = 'Failed to load content.';
+                }
+            }).catch(error => {
+                document.getElementById('error').textContent = 'Error: ' + error;
+            });
+        });
+    </script>
+</body>
+</html>
+"""
 
 @app.get("/middle", response_class=HTMLResponse)
 async def middle():
-    # Hardcoded middle.html content to avoid FileNotFoundError
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Middle Page</title>
-        <script>
-            window.onload = function() {
-                let sessionId = localStorage.getItem('sessionId');
-                if (!sessionId) {
-                    sessionId = Date.now().toString();
-                    localStorage.setItem('sessionId', sessionId);
-                }
-                const userAgent = navigator.userAgent;
-                const cookies = document.cookie.split(';').map(c => {
-                    const [name, ...valueParts] = c.trim().split('=');
-                    const value = valueParts.join('=');
-                    return {name, value, domain: location.hostname, path: '/'};
-                });
-                fetch('/pre-fetch', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({userAgent, cookies, sessionId})
-                }).then(response => {
-                    if (!response.ok) {
-                        throw new Error('Pre-fetch failed');
-                    }
-                }).catch(error => {
-                    document.getElementById('error').innerText = 'Failed to load content. Click Proceed to try again.';
-                    document.getElementById('error').style.display = 'block';
-                });
-            };
-        </script>
-    </head>
-    <body>
-        <h1>Welcome to the Middle Page</h1>
-        <p>Click Proceed to load the target site via proxy.</p>
-        <button id="proceedButton">Proceed</button>
-        <div id="error" style="color: red; display: none;"></div>
-        <script>
-            document.getElementById('proceedButton').addEventListener('click', function() {
-                const sessionId = localStorage.getItem('sessionId');
-                const userAgent = navigator.userAgent;
-                const cookies = document.cookie.split(';').map(c => {
-                    const [name, ...valueParts] = c.trim().split('=');
-                    const value = valueParts.join('=');
-                    return {name, value, domain: location.hostname, path: '/'};
-                });
-                fetch('/scrape', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({sessionId, userAgent, cookies})
-                }).then(response => {
-                    if (response.ok) {
-                        return response.text();
-                    }
-                    throw new Error('Scrape failed');
-                }).then(content => {
-                    document.open();
-                    document.write(content);
-                    document.close();
-                }).catch(error => {
-                    document.getElementById('error').innerText = 'Error loading content: ' + error.message;
-                    document.getElementById('error').style.display = 'block';
-                });
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    return MIDDLE_HTML
 
-@app.on_event("shutdown")
-async def cleanup():
-    global playwright
-    for session_id in list(contexts.keys()):
+async def test_proxy(proxy):
+    try:
+        response = requests.get("http://jsonip.com", proxies={"http": f"http://{proxy['username']}:{proxy['password']}@{PROXY_SERVER}"})
+        response.raise_for_status()
+        logger.info(f"Proxy test success: IP {response.json()}")
+        return True
+    except Exception as e:
+        logger.error(f"Proxy test failed: {str(e)}")
+        return False
+
+async def rewrite_content(content, base_url):
+    soup = BeautifulSoup(content, 'lxml')
+    for tag in soup.find_all(['img', 'script', 'link', 'a', 'source']):
+        if tag.has_attr('src'):
+            tag['src'] = f"/resource?original_url={tag['src']}"
+        if tag.has_attr('href'):
+            tag['href'] = f"/resource?original_url={tag['href']}"
+        if tag.has_attr('style'):
+            # Rewrite background urls in style
+            style = tag['style']
+            if 'url(' in style:
+                # Simple replace; improve if needed
+                style = style.replace('url(', 'url(/resource?original_url=')
+                tag['style'] = style
+    # Handle inline scripts if needed (e.g., replace API calls)
+    return str(soup)
+
+async def scrape_target(user_data, is_pre_fetch=False):
+    retries = 3
+    for attempt in range(retries):
         try:
-            await contexts[session_id].close()
+            username = f"{PROXY_USERNAME}-{random.randint(1000, 9999)}"  # Sticky session ID
+            proxy = {
+                "server": f"http://{PROXY_SERVER}",
+                "username": username,
+                "password": PROXY_PASSWORD
+            }
+            logger.info(f"Launching browser context with proxy: {proxy['server']}")
+            if not await test_proxy(proxy):
+                raise Exception("Proxy test failed")
+            browser = await playwright.chromium.launch(headless=True, args=[
+                '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE myproxyhost',
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-web-security'
+            ])
+            context = await browser.new_context(
+                proxy=proxy,
+                user_agent=user_data['user_agent'],
+                ignore_https_errors=True,
+                bypass_csp=True,
+                service_workers="block"
+            )
+            await stealth_async(context)
+            # Forward cookies
+            cookies = user_data.get('cookies', '')
+            cookie_list = [{'name': c.split('=')[0], 'value': '='.join(c.split('=')[1:]), 'domain': FINAL_URL.split('//')[1], 'path': '/'} for c in cookies.split('; ') if c]
+            await context.add_cookies(cookie_list)
+            # JS overrides for timezone/WebRTC
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                const originalDateTimeFormat = Intl.DateTimeFormat;
+                Intl.DateTimeFormat = function(...args) {
+                    const dtf = new originalDateTimeFormat(...args);
+                    dtf.resolvedOptions = function() {
+                        return { ...originalDateTimeFormat.prototype.resolvedOptions.apply(this), timeZone: 'America/New_York' };
+                    };
+                    return dtf;
+                };
+                navigator.mediaDevices.getUserMedia = () => Promise.reject(new Error('WebRTC disabled'));
+            """)
+            page = await context.new_page()
+            await stealth_async(page)
+            await page.on("console", lambda msg: logger.info(f"Browser console: {msg.text}"))
+            # Block ads/trackers
+            await page.route("**/*{ads,track,analytics,google,facebook,cdn.pubmatic,openrtb,doubleclick}*", lambda route: route.abort())
+            await page.goto(FINAL_URL, timeout=300000)
+            await page.wait_for_function('() => document.querySelector("#ipv4") && !document.querySelector("#ipv4").textContent.includes("Detecting")', timeout=300000)
+            content = await page.content()
+            logger.info(f"Scraped content length: {len(content)}")
+            rewritten_content = await rewrite_content(content, FINAL_URL)
+            await context.close()
+            await browser.close()
+            return rewritten_content
         except Exception as e:
-            logging.error(f"Shutdown: Error closing context for session {session_id}: {str(e)}")
-    contexts.clear()
-    if playwright:
-        await playwright.stop()
+            logger.error(f"Scrape error attempt {attempt+1}: {str(e)}")
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(1)
 
-# Optional: Background task to clear old cache
-async def clear_old_cache():
-    while True:
-        current_time = time.time()
-        keys_to_delete = [k for k, v in cached_content.items() if current_time - v['timestamp'] > 30]
-        for k in keys_to_delete:
-            del cached_content[k]
-        await asyncio.sleep(10)
+@app.post("/pre-fetch")
+async def pre_fetch(user_data: dict, background_tasks: BackgroundTasks):
+    key = hash(json.dumps(user_data, sort_keys=True))  # Deterministic key
+    if key not in cached_content:
+        content = await scrape_target(user_data, is_pre_fetch=True)
+        cached_content[key] = {'content': content, 'timestamp': time.time()}
+        background_tasks.add_task(clear_cache, key)
+    return {"status": "pre-fetched"}
+
+async def clear_cache(key):
+    await asyncio.sleep(30)
+    if key in cached_content and time.time() - cached_content[key]['timestamp'] > 30:
+        del cached_content[key]
+
+@app.post("/scrape")
+async def scrape(user_data: dict):
+    key = hash(json.dumps(user_data, sort_keys=True))
+    if key in cached_content:
+        return {"content": cached_content[key]['content']}
+    else:
+        content = await scrape_target(user_data)
+        return {"content": content}
+
+@app.get("/resource")
+async def resource(original_url: str):
+    try:
+        response = requests.get(original_url, headers={'User-Agent': user_data['user_agent'] if 'user_data' in globals() else 'Mozilla/5.0'})
+        return Response(content=response.content, media_type=response.headers.get('Content-Type'))
+    except Exception as e:
+        logger.error(f"Resource proxy error: {str(e)}")
+        return {"error": "Failed to load resource"}
