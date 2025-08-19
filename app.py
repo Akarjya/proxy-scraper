@@ -11,7 +11,6 @@ from urllib.parse import quote, urljoin
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from playwright.async_api import async_playwright, Error as PlaywrightError
-from playwright_stealth import stealth_async  # Correct import
 from itsdangerous import TimestampSigner
 from bs4 import BeautifulSoup
 
@@ -114,7 +113,6 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
 
         try:
             page = await context.new_page()
-            await stealth_async(page)  # Apply stealth to page
             # Log browser errors
             page.on("pageerror", lambda err: logging.error(f"Page error: {err}"))
             page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
@@ -122,10 +120,10 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
             await context.add_cookies(cookies)  # Add cookies to context
             await page.goto(FINAL_URL, timeout=120000)
             await page.wait_for_load_state('networkidle')
-            # Wait for IP to load (adjust selector if needed, e.g., '#ipv4' or '.ip-value')
-            await page.wait_for_function('() => document.querySelector("#ipv4, .ip-value") && document.querySelector("#ipv4, .ip-value").innerText !== "Detecting..."', timeout=60000)
+            # Wait for IP to load (for iplocation.io, adjust selector if needed)
+            await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
             content = await page.content()
-            # Rewrite URLs to proxy
+            # Rewrite URLs
             content = rewrite_urls(content, session_id, FINAL_URL)
             await page.close()
             cached_content[session_id] = {'content': content, 'timestamp': time.time()}
@@ -166,7 +164,6 @@ async def scrape_internal(request: Request, retry_count: int = 0):
         cookies = data.get('cookies', [])
 
         page = await context.new_page()
-        await stealth_async(page)  # Apply stealth to page
         # Log browser errors
         page.on("pageerror", lambda err: logging.error(f"Page error: {err}"))
         page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
@@ -175,9 +172,9 @@ async def scrape_internal(request: Request, retry_count: int = 0):
         await page.goto(FINAL_URL, timeout=120000)
         await page.wait_for_load_state('networkidle')
         # Wait for IP to load
-        await page.wait_for_function('() => document.querySelector("#ipv4, .ip-value") && document.querySelector("#ipv4, .ip-value").innerText !== "Detecting..."', timeout=60000)
+        await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
         content = await page.content()
-        # Rewrite URLs to proxy
+        # Rewrite URLs
         content = rewrite_urls(content, session_id, FINAL_URL)
         await page.close()
 
@@ -213,10 +210,17 @@ def rewrite_urls(content: str, session_id: str, base_url: str) -> str:
                         original = urljoin(base, original)
                     tag[attr] = f"/resource?session_id={session_id}&url={quote(original)}"
 
-    # For style and script tags with urls
+    # For style urls
     for tag in soup.find_all('style'):
         if tag.string:
             tag.string = tag.string.replace('url(', 'url(/resource?session_id=' + session_id + '&url=')
+
+    # For script tags, if inline, replace API URLs
+    for tag in soup.find_all('script'):
+        if tag.string and 'api.iplocation.io' in tag.string:
+            tag.string = tag.string.replace('https://api.iplocation.io/', '/resource?session_id=' + session_id + '&url=https%3A%2F%2Fapi.iplocation.io%2F')
+        if tag.string and 'ex.ingage.tech' in tag.string:
+            tag.string = tag.string.replace('https://ex.ingage.tech/', '/resource?session_id=' + session_id + '&url=https%3A%2F%2Fex.ingage.tech%2F')
 
     return str(soup)
 
@@ -231,114 +235,4 @@ async def proxy_resource(session_id: str, url: str, request: Request):
     password = "pMBwu34BjjGr5urD"
     proxy_url = f"http://{username}:{password}@pg.proxi.es:20000"
 
-    proxies = {"http": proxy_url, "https": proxy_url}
-
-    headers = dict(request.headers)  # Forward user headers
-    headers.pop('host', None)
-    headers.pop('content-length', None)
-
-    try:
-        resp = requests.get(url, proxies=proxies, headers=headers, stream=True, timeout=30)
-        resp.raise_for_status()
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        response_headers = {name: value for name, value in resp.headers.items() if name.lower() not in excluded_headers}
-        return Response(content=resp.content, status_code=resp.status_code, headers=response_headers)
-    except Exception as e:
-        logging.error(f"Resource proxy error for {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/middle", response_class=HTMLResponse)
-async def middle():
-    # Hardcoded middle.html content to avoid FileNotFoundError
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Middle Page</title>
-        <script>
-            window.onload = function() {
-                let sessionId = localStorage.getItem('sessionId');
-                if (!sessionId) {
-                    sessionId = Date.now().toString();
-                    localStorage.setItem('sessionId', sessionId);
-                }
-                const userAgent = navigator.userAgent;
-                const cookies = document.cookie.split(';').map(c => {
-                    const [name, ...valueParts] = c.trim().split('=');
-                    const value = valueParts.join('=');
-                    return {name, value, domain: location.hostname, path: '/'};
-                });
-                fetch('/pre-fetch', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({userAgent, cookies, sessionId})
-                }).then(response => {
-                    if (!response.ok) {
-                        throw new Error('Pre-fetch failed');
-                    }
-                }).catch(error => {
-                    document.getElementById('error').innerText = 'Failed to load content. Click Proceed to try again.';
-                    document.getElementById('error').style.display = 'block';
-                });
-            };
-        </script>
-    </head>
-    <body>
-        <h1>Welcome to the Middle Page</h1>
-        <p>Click Proceed to load the target site via proxy.</p>
-        <button id="proceedButton">Proceed</button>
-        <div id="error" style="color: red; display: none;"></div>
-        <script>
-            document.getElementById('proceedButton').addEventListener('click', function() {
-                const sessionId = localStorage.getItem('sessionId');
-                const userAgent = navigator.userAgent;
-                const cookies = document.cookie.split(';').map(c => {
-                    const [name, ...valueParts] = c.trim().split('=');
-                    const value = valueParts.join('=');
-                    return {name, value, domain: location.hostname, path: '/'};
-                });
-                fetch('/scrape', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({sessionId, userAgent, cookies})
-                }).then(response => {
-                    if (response.ok) {
-                        return response.text();
-                    }
-                    throw new Error('Scrape failed');
-                }).then(content => {
-                    document.open();
-                    document.write(content);
-                    document.close();
-                }).catch(error => {
-                    document.getElementById('error').innerText = 'Error loading content: ' + error.message;
-                    document.getElementById('error').style.display = 'block';
-                });
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
-
-@app.on_event("shutdown")
-async def cleanup():
-    global playwright
-    for session_id in list(contexts.keys()):
-        try:
-            await contexts[session_id].close()
-        except Exception as e:
-            logging.error(f"Shutdown: Error closing context for session {session_id}: {str(e)}")
-    contexts.clear()
-    if playwright:
-        await playwright.stop()
-
-# Optional: Background task to clear old cache
-async def clear_old_cache():
-    while True:
-        current_time = time.time()
-        keys_to_delete = [k for k, v in cached_content.items() if current_time - v['timestamp'] > 30]
-        for k in keys_to_delete:
-            del cached_content[k]
-        await asyncio.sleep(10)
+    proxies = {"http": proxy_url, "https":
