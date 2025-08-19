@@ -5,12 +5,15 @@ import time
 import asyncio
 import os
 import hashlib  # For deterministic random based on session_id
-import requests  # Added for proxy test
+import requests  # For proxy test and resource proxy
+from urllib.parse import quote, urljoin
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from playwright.async_api import async_playwright, Error as PlaywrightError
+from playwright_stealth import stealth_async  # For stealth
 from itsdangerous import TimestampSigner
+from bs4 import BeautifulSoup
 
 from config import FINAL_URL
 
@@ -38,7 +41,6 @@ def generate_random_string_from_session(session_id, length=10):
 async def get_or_create_context(session_id: str):
     if session_id in contexts:
         return contexts[session_id]
-    # No is_connected check here; we'll handle closed contexts in the caller with try-except
 
     # Generate deterministic random for sticky
     random_str = generate_random_string_from_session(session_id)
@@ -80,9 +82,14 @@ async def get_or_create_context(session_id: str):
         timezone_id="America/New_York",
         locale="en-US",
         java_script_enabled=True,
-        ignore_https_errors=True,  # Added to ignore SSL errors
-        service_workers='block',  # Added to block service workers if interfering
+        ignore_https_errors=True,  # Ignore SSL errors
+        service_workers='block',  # Block service workers if interfering
     )
+
+    # Apply stealth
+    page = await context.new_page()
+    await stealth_async(page)
+    await page.close()
 
     # JS overrides for WebRTC disable, timezone, language
     await context.add_init_script("""
@@ -97,7 +104,7 @@ async def get_or_create_context(session_id: str):
 
 async def pre_fetch_internal(request: Request, retry_count: int = 0):
     max_retries = 3
-    if retry_count >= max_retries:  # Fixed to >= to limit properly
+    if retry_count >= max_retries:
         raise HTTPException(status_code=500, detail="Max retries exceeded for pre-fetch")
 
     try:
@@ -117,8 +124,12 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
             page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
             await page.set_extra_http_headers({'User-Agent': user_agent})
             await context.add_cookies(cookies)  # Add cookies to context
-            await page.goto(FINAL_URL, timeout=120000)  # Increased timeout
+            await page.goto(FINAL_URL, timeout=120000)
+            await page.wait_for_load_state('networkidle')
+            await page.wait_for_selector('#ipv4', state='visible', timeout=60000)  # Wait for IP element, adjust selector if needed
             content = await page.content()
+            # Rewrite URLs
+            content = rewrite_urls(content, session_id)
             await page.close()
             cached_content[session_id] = {'content': content, 'timestamp': time.time()}
             return {"status": "success"}
@@ -140,7 +151,7 @@ async def pre_fetch(request: Request):
 
 async def scrape_internal(request: Request, retry_count: int = 0):
     max_retries = 3
-    if retry_count >= max_retries:  # Fixed to >=
+    if retry_count >= max_retries:
         raise HTTPException(status_code=500, detail="Max retries exceeded for scrape")
 
     try:
@@ -164,7 +175,11 @@ async def scrape_internal(request: Request, retry_count: int = 0):
         await page.set_extra_http_headers({'User-Agent': user_agent})
         await context.add_cookies(cookies)
         await page.goto(FINAL_URL, timeout=120000)
+        await page.wait_for_load_state('networkidle')
+        await page.wait_for_selector('#ipv4', state='visible', timeout=60000)  # Adjust selector if needed
         content = await page.content()
+        # Rewrite URLs
+        content = rewrite_urls(content, session_id)
         await page.close()
 
         cached_content[session_id] = {'content': content, 'timestamp': time.time()}
@@ -184,6 +199,49 @@ async def scrape_internal(request: Request, retry_count: int = 0):
 @app.post("/scrape")
 async def scrape(request: Request):
     return await scrape_internal(request)
+
+def rewrite_urls(content: str, session_id: str) -> str:
+    soup = BeautifulSoup(content, 'lxml')
+    base_url = FINAL_URL.rsplit('/', 1)[0] + '/'  # For relative to absolute
+
+    for tag in soup.find_all(True):
+        for attr in ['src', 'href', 'action', 'data-src', 'poster', 'data-background']:
+            if attr in tag.attrs:
+                original_url = tag[attr]
+                if original_url and not original_url.startswith('data:') and not original_url.startswith('#'):
+                    # Make absolute
+                    if not original_url.startswith('http'):
+                        original_url = urljoin(base_url, original_url)
+                    tag[attr] = f"/resource?session_id={session_id}&url={quote(original_url)}"
+
+    return str(soup)
+
+@app.get("/resource")
+async def proxy_resource(session_id: str, url: str, request: Request):
+    if not session_id or not url:
+        raise HTTPException(status_code=400, detail="Missing parameters")
+
+    # Get username from session_id
+    random_str = generate_random_string_from_session(session_id)
+    username = f"KMwYgm4pR4upF6yX-s-{random_str}-co-USA-st-NY-ci-NewYorkCity"
+    password = "pMBwu34BjjGr5urD"
+    proxy_url = f"http://{username}:{password}@pg.proxi.es:20000"
+
+    proxies = {"http": proxy_url, "https": proxy_url}
+
+    headers = dict(request.headers)  # Forward user headers
+    headers.pop('host', None)
+    headers.pop('content-length', None)
+
+    try:
+        resp = requests.get(url, proxies=proxies, headers=headers, stream=True, timeout=30)
+        resp.raise_for_status()
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        response_headers = {name: value for name, value in resp.headers.items() if name.lower() not in excluded_headers}
+        return Response(content=resp.content, status_code=resp.status_code, headers=response_headers)
+    except Exception as e:
+        logging.error(f"Resource proxy error for {url}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/middle", response_class=HTMLResponse)
 async def middle():
