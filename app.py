@@ -118,7 +118,7 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
             page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
             await page.set_extra_http_headers({'User-Agent': user_agent})
             await context.add_cookies(cookies)  # Add cookies to context
-            await page.goto(FINAL_URL, timeout=120000)
+            await page.goto(FINAL_URL, timeout=180000)  # Increased to 3min
             await page.wait_for_load_state('networkidle')
             # Wait for IP to load
             await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
@@ -169,7 +169,7 @@ async def scrape_internal(request: Request, retry_count: int = 0):
         page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
         await page.set_extra_http_headers({'User-Agent': user_agent})
         await context.add_cookies(cookies)
-        await page.goto(FINAL_URL, timeout=120000)
+        await page.goto(FINAL_URL, timeout=180000)  # Increased
         await page.wait_for_load_state('networkidle')
         # Wait for IP to load
         await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
