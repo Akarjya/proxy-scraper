@@ -8,7 +8,7 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from starlette.responses import Response
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth  # Updated import for v2.0.0+
 from bs4 import BeautifulSoup
 from config import FINAL_URL
 
@@ -134,49 +134,50 @@ async def scrape_target(user_data, is_pre_fetch=False):
             logger.info(f"Launching browser context with proxy: {proxy['server']}")
             if not await test_proxy(proxy):
                 raise Exception("Proxy test failed")
-            browser = await playwright.chromium.launch(headless=True, args=[
-                '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE myproxyhost',
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-web-security'
-            ])
-            context = await browser.new_context(
-                proxy=proxy,
-                user_agent=user_data['user_agent'],
-                ignore_https_errors=True,
-                bypass_csp=True,
-                service_workers="block"
-            )
-            await stealth_async(context)
-            # Forward cookies
-            cookies = user_data.get('cookies', '')
-            cookie_list = [{'name': c.split('=')[0], 'value': '='.join(c.split('=')[1:]), 'domain': FINAL_URL.split('//')[1], 'path': '/'} for c in cookies.split('; ') if c]
-            await context.add_cookies(cookie_list)
-            # JS overrides for timezone/WebRTC
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                const originalDateTimeFormat = Intl.DateTimeFormat;
-                Intl.DateTimeFormat = function(...args) {
-                    const dtf = new originalDateTimeFormat(...args);
-                    dtf.resolvedOptions = function() {
-                        return { ...originalDateTimeFormat.prototype.resolvedOptions.apply(this), timeZone: 'America/New_York' };
+            stealth = Stealth()  # New: Create Stealth instance for v2.0.0+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=[
+                    '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE myproxyhost',
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-web-security'
+                ])
+                context = await browser.new_context(
+                    proxy=proxy,
+                    user_agent=user_data['user_agent'],
+                    ignore_https_errors=True,
+                    bypass_csp=True,
+                    service_workers="block"
+                )
+                await stealth.apply_stealth_async(context)  # New: Apply stealth to context (covers all pages)
+                # Forward cookies
+                cookies = user_data.get('cookies', '')
+                cookie_list = [{'name': c.split('=')[0], 'value': '='.join(c.split('=')[1:]), 'domain': FINAL_URL.split('//')[1], 'path': '/'} for c in cookies.split('; ') if c]
+                await context.add_cookies(cookie_list)
+                # JS overrides for timezone/WebRTC (Stealth handles most, but keep custom if needed)
+                await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                    const originalDateTimeFormat = Intl.DateTimeFormat;
+                    Intl.DateTimeFormat = function(...args) {
+                        const dtf = new originalDateTimeFormat(...args);
+                        dtf.resolvedOptions = function() {
+                            return { ...originalDateTimeFormat.prototype.resolvedOptions.apply(this), timeZone: 'America/New_York' };
+                        };
+                        return dtf;
                     };
-                    return dtf;
-                };
-                navigator.mediaDevices.getUserMedia = () => Promise.reject(new Error('WebRTC disabled'));
-            """)
-            page = await context.new_page()
-            await stealth_async(page)
-            await page.on("console", lambda msg: logger.info(f"Browser console: {msg.text}"))
-            # Block ads/trackers
-            await page.route("**/*{ads,track,analytics,google,facebook,cdn.pubmatic,openrtb,doubleclick}*", lambda route: route.abort())
-            await page.goto(FINAL_URL, timeout=300000)
-            await page.wait_for_function('() => document.querySelector("#ipv4") && !document.querySelector("#ipv4").textContent.includes("Detecting")', timeout=300000)
-            content = await page.content()
-            logger.info(f"Scraped content length: {len(content)}")
-            rewritten_content = await rewrite_content(content, FINAL_URL)
-            await context.close()
-            await browser.close()
+                    navigator.mediaDevices.getUserMedia = () => Promise.reject(new Error('WebRTC disabled'));
+                """)
+                page = await context.new_page()
+                await page.on("console", lambda msg: logger.info(f"Browser console: {msg.text}"))
+                # Block ads/trackers
+                await page.route("**/*{ads,track,analytics,google,facebook,cdn.pubmatic,openrtb,doubleclick}*", lambda route: route.abort())
+                await page.goto(FINAL_URL, timeout=300000)
+                await page.wait_for_function('() => document.querySelector("#ipv4") && !document.querySelector("#ipv4").textContent.includes("Detecting")', timeout=300000)
+                content = await page.content()
+                logger.info(f"Scraped content length: {len(content)}")
+                rewritten_content = await rewrite_content(content, FINAL_URL)
+                await context.close()
+                await browser.close()
             return rewritten_content
         except Exception as e:
             logger.error(f"Scrape error attempt {attempt+1}: {str(e)}")
