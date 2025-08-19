@@ -9,7 +9,7 @@ import requests  # For proxy test and resource proxy
 from urllib.parse import quote, urljoin
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses = HTMLResponse, JSONResponse, Response
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from itsdangerous import TimestampSigner
 from bs4 import BeautifulSoup
@@ -118,10 +118,10 @@ async def pre_fetch_internal(request: Request, retry_count: int = 0):
             page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
             await page.set_extra_http_headers({'User-Agent': user_agent})
             await context.add_cookies(cookies)  # Add cookies to context
-            await page.goto(FINAL_URL, timeout=120000)
+            await page.goto(FINAL_URL, timeout=60000)  # Reduced timeout to avoid 502
             await page.wait_for_load_state('networkidle')
-            # Wait for IP to load (from image, selector #ipv4)
-            await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
+            # Wait for IP to load
+            await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=30000)
             content = await page.content()
             # Rewrite URLs
             content = rewrite_urls(content, session_id, FINAL_URL)
@@ -169,10 +169,10 @@ async def scrape_internal(request: Request, retry_count: int = 0):
         page.on("console", lambda msg: logging.info(f"Browser console: {msg.text}"))
         await page.set_extra_http_headers({'User-Agent': user_agent})
         await context.add_cookies(cookies)
-        await page.goto(FINAL_URL, timeout=120000)
+        await page.goto(FINAL_URL, timeout=60000)  # Reduced
         await page.wait_for_load_state('networkidle')
         # Wait for IP to load
-        await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=60000)
+        await page.wait_for_function('() => document.querySelector("#ipv4") && document.querySelector("#ipv4").innerText !== "Not Detected"', timeout=30000)
         content = await page.content()
         # Rewrite URLs
         content = rewrite_urls(content, session_id, FINAL_URL)
@@ -252,7 +252,7 @@ async def proxy_resource(session_id: str, url: str, request: Request):
 
 @app.get("/middle", response_class=HTMLResponse)
 async def middle():
-    # Hardcoded middle.html content to avoid FileNotFoundError
+    # Hardcoded middle.html with iframe for content to avoid document.write warning
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
@@ -311,9 +311,14 @@ async def middle():
                     }
                     throw new Error('Scrape failed');
                 }).then(content => {
-                    document.open();
-                    document.write(content);
-                    document.close();
+                    // Use iframe to load content to avoid document.write issues
+                    const iframe = document.createElement('iframe');
+                    iframe.style.width = '100%';
+                    iframe.style.height = '100vh';
+                    iframe.style.border = 'none';
+                    iframe.srcdoc = content;
+                    document.body.innerHTML = '';
+                    document.body.appendChild(iframe);
                 }).catch(error => {
                     document.getElementById('error').innerText = 'Error loading content: ' + error.message;
                     document.getElementById('error').style.display = 'block';
